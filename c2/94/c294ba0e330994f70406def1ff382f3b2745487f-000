@@ -1,0 +1,218 @@
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+from copy import deepcopy
+from pathlib import Path
+
+from PIL import Image
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC_PATH = ROOT / "templates" / "template-spec.json"
+DEFAULT_CONFIG_PATH = ROOT / "workshop" / "template-config.json"
+HTML_TEMPLATE = ROOT / "workshop" / "template-workshop.template.html"
+DEFAULT_HTML = ROOT / "template-workshop.html"
+CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+
+def cli() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Génère un visuel depuis un fond et un template mesuré.")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
+    parser.add_argument("--background", type=Path)
+    parser.add_argument("--template", choices=["single_center", "kicker_over_title", "title_over_subtitle", "editorial_list"])
+    parser.add_argument("--primary")
+    parser.add_argument("--secondary")
+    parser.add_argument("--output-html", type=Path, default=DEFAULT_HTML)
+    parser.add_argument("--output-png", type=Path)
+    return parser.parse_args()
+
+
+def scaled(value: float, scale: float) -> float:
+    result = round(value * scale, 3)
+    return int(result) if result.is_integer() else result
+
+
+def derive_config(
+    base: dict,
+    spec: dict,
+    background: Path,
+    template_id: str,
+    primary_text: str,
+    secondary_text: str | None,
+) -> dict:
+    if not background.exists():
+        raise SystemExit(f"Fond absent : {background}")
+    with Image.open(background) as image:
+        width, height = image.size
+    template = spec["templates"][template_id]
+    reference = spec["coordinate_system"]
+    scale_x = width / reference["canvas_width"]
+    scale_y = height / reference["canvas_height"]
+    primary = template["primary"]
+    anchor_x = template.get("anchor_x", primary.get("anchor_x"))
+    if anchor_x is None:
+        raise SystemExit(f"Ancre primaire absente du template : {template_id}")
+
+    result = deepcopy(base)
+    result["canvas"] = {"width": width, "height": height}
+    result["background"] = str(background.resolve())
+    result["template_id"] = template_id
+    result["primary_text"] = primary_text.upper()
+    result["secondary_text"] = (secondary_text or "").upper()
+    result["primary"] = {
+        "font_url": "file:///Users/zenray/Library/Fonts/AnthropicSerif-Regular.ttf" if template_id == "single_center" else str((ROOT / "assets/fonts/Cinzel-Variable.ttf").resolve()),
+        "font_family": "AnthropicSerif" if template_id == "single_center" else "Cinzel",
+        "font_size": scaled(primary["font_size"], scale_x),
+        "font_weight": primary["font_weight"],
+        "letter_spacing": scaled(primary["letter_spacing"], scale_x),
+        "anchor_x": scaled(anchor_x, scale_x),
+        "baseline_y": scaled(primary["baseline_y"], scale_y),
+        "color": spec["colors"]["text"],
+        "shadow": "0 1px 2px rgba(0,0,0,0.48)"
+    }
+    result["secondary"] = None
+    result.pop("editorial", None)
+
+    if "secondary" in template:
+        if not secondary_text:
+            raise SystemExit(f"Le template {template_id} exige --secondary")
+        secondary = template["secondary"]
+        result["secondary"] = {
+            "anchor_x": scaled(template["anchor_x"], scale_x),
+            "baseline_y": scaled(secondary["baseline_y"], scale_y),
+            "font_size": scaled(secondary["font_size"], scale_x),
+            "font_weight": secondary["font_weight"],
+            "letter_spacing": scaled(secondary["letter_spacing"], scale_x)
+        }
+
+    if template_id == "editorial_list":
+        editorial = template
+        divider = editorial["divider"]["bbox"]
+        lines = [line.strip().upper() for line in (secondary_text or "").split("\n") if line.strip()]
+        if not lines:
+            lines = editorial["list"]["lines"]
+        result["editorial"] = {
+            "divider": {
+                "x": scaled(divider[0], scale_x),
+                "y": scaled(divider[1], scale_y),
+                "width": max(1, scaled(divider[2], scale_x)),
+                "height": scaled(divider[3], scale_y)
+            },
+            "diamond_center_y": scaled(editorial["divider"]["diamond_center"][1], scale_y),
+            "list": {
+                "x": scaled(editorial["list"]["x"], scale_x),
+                "first_baseline_y": scaled(editorial["list"]["first_baseline_y"], scale_y),
+                "font_size": scaled(editorial["list"]["font_size"], scale_x),
+                "letter_spacing": scaled(editorial["list"]["letter_spacing"], scale_x),
+                "line_height": scaled(editorial["list"]["line_height"], scale_y),
+                "lines": lines
+            }
+        }
+    return result
+
+
+def validate_config(config: dict) -> None:
+    required = ["canvas", "background", "template_id", "primary_text", "primary", "photo"]
+    missing = [key for key in required if key not in config]
+    if missing:
+        raise SystemExit("Paramètres manquants : " + ", ".join(missing))
+    background = Path(config["background"])
+    if not background.is_absolute():
+        background = ROOT / background
+    if not background.exists():
+        raise SystemExit(f"Fond absent : {background}")
+    config["background"] = str(background.resolve())
+    if config["canvas"]["width"] <= 0 or config["canvas"]["height"] <= 0:
+        raise SystemExit("Dimensions de canvas invalides")
+    photo_required = {
+        "vignette", "selective", "levels", "blackAndWhite", "saturation", "vibrance",
+        "brilliance", "exposure", "highlights", "shadows", "brightness", "contrast",
+        "blackPoint", "filter", "filterStrength"
+    }
+    missing_photo = sorted(photo_required - set(config["photo"]))
+    if missing_photo:
+        raise SystemExit("Réglages photo manquants : " + ", ".join(missing_photo))
+    if len(config["photo"]["selective"]) != 6:
+        raise SystemExit("Selective Color exige six canaux")
+
+
+def materialize(config: dict, destination: Path) -> None:
+    content = HTML_TEMPLATE.read_text()
+    payload = json.dumps(config, ensure_ascii=False).replace("</", "<\\/")
+    content = content.replace("{{CONFIG_JSON}}", payload)
+    content = content.replace("{{BASE_URL}}", ROOT.resolve().as_uri() + "/")
+    remaining = sorted(set(re.findall(r"\{\{([^}]+)\}\}", content)))
+    if remaining:
+        raise SystemExit("Paramètres HTML non résolus : " + ", ".join(remaining))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(content)
+
+
+def chrome_args(html: Path, width: int, height: int) -> list[str]:
+    return [
+        CHROME,
+        "--headless=new",
+        "--allow-file-access-from-files",
+        "--enable-unsafe-swiftshader",
+        "--use-gl=angle",
+        "--use-angle=swiftshader",
+        "--hide-scrollbars",
+        "--force-device-scale-factor=1",
+        "--virtual-time-budget=2500",
+        f"--window-size={width},{height}",
+        f"file://{html.resolve()}?render=1"
+    ]
+
+
+def render(html: Path, output: Path, width: int, height: int) -> None:
+    dump = subprocess.run(
+        [*chrome_args(html, width, height)[:-1], "--dump-dom", chrome_args(html, width, height)[-1]],
+        check=True,
+        capture_output=True,
+        text=True
+    ).stdout
+    if 'data-render-ready="true"' not in dump:
+        raise SystemExit("Le workshop n’a pas signalé que le rendu était prêt")
+    if 'data-neutral-test="fail"' in dump:
+        raise SystemExit("Le test de neutralité des réglages photo échoue")
+    if 'data-effects-test="pass"' not in dump:
+        raise SystemExit("Le test complet des réglages photo échoue")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [*chrome_args(html, width, height)[:-1], f"--screenshot={output}", chrome_args(html, width, height)[-1]],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    with Image.open(output) as image:
+        if image.size != (width, height):
+            raise SystemExit(f"Mauvaise dimension de rendu : {image.size}")
+
+
+def main() -> None:
+    args = cli()
+    spec = json.loads(SPEC_PATH.read_text())
+    config = json.loads(args.config.read_text())
+    if any(value is not None for value in (args.background, args.template, args.primary, args.secondary)):
+        if not args.background or not args.template or not args.primary:
+            raise SystemExit("Les surcharges exigent --background, --template et --primary ensemble")
+        config = derive_config(config, spec, args.background, args.template, args.primary, args.secondary)
+    validate_config(config)
+    output_html = args.output_html if args.output_html.is_absolute() else ROOT / args.output_html
+    materialize(config, output_html)
+    output_png = args.output_png
+    if output_png is None and config.get("output"):
+        output_png = Path(config["output"])
+    if output_png:
+        if not output_png.is_absolute():
+            output_png = ROOT / output_png
+        render(output_html, output_png, config["canvas"]["width"], config["canvas"]["height"])
+        print(output_png)
+    print(output_html)
+
+
+if __name__ == "__main__":
+    main()
